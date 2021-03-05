@@ -6,11 +6,17 @@ package io.flutter.plugins.webviewflutter;
 
 import android.annotation.TargetApi;
 import android.content.Context;
+import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Handler;
+import android.os.Message;
 import android.view.View;
+import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebStorage;
+import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import androidx.annotation.NonNull;
 import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
@@ -28,29 +34,94 @@ public class FlutterWebView implements PlatformView, MethodCallHandler {
   private final FlutterWebViewClient flutterWebViewClient;
   private final Handler platformThreadHandler;
 
+  // Verifies that a url opened by `Window.open` has a secure url.
+  private class FlutterWebChromeClient extends WebChromeClient {
+    @Override
+    public boolean onCreateWindow(
+        final WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
+      final WebViewClient webViewClient =
+          new WebViewClient() {
+            @TargetApi(Build.VERSION_CODES.LOLLIPOP)
+            @Override
+            public boolean shouldOverrideUrlLoading(
+                @NonNull WebView view, @NonNull WebResourceRequest request) {
+              final String url = request.getUrl().toString();
+              if (!flutterWebViewClient.shouldOverrideUrlLoading(
+                  FlutterWebView.this.webView, request)) {
+                webView.loadUrl(url);
+              }
+              return true;
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+              if (!flutterWebViewClient.shouldOverrideUrlLoading(
+                  FlutterWebView.this.webView, url)) {
+                webView.loadUrl(url);
+              }
+              return true;
+            }
+          };
+
+      final WebView newWebView = new WebView(view.getContext());
+      newWebView.setWebViewClient(webViewClient);
+
+      final WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
+      transport.setWebView(newWebView);
+      resultMsg.sendToTarget();
+
+      return true;
+    }
+
+    @Override
+    public void onProgressChanged(WebView view, int progress) {
+      flutterWebViewClient.onLoadingProgress(progress);
+    }
+  }
+
+  @TargetApi(Build.VERSION_CODES.JELLY_BEAN_MR1)
   @SuppressWarnings("unchecked")
   FlutterWebView(
-      Context context,
+      final Context context,
       BinaryMessenger messenger,
       int id,
       Map<String, Object> params,
-      final View containerView) {
+      View containerView) {
+
+    DisplayListenerProxy displayListenerProxy = new DisplayListenerProxy();
+    DisplayManager displayManager =
+        (DisplayManager) context.getSystemService(Context.DISPLAY_SERVICE);
+    displayListenerProxy.onPreWebViewInitialization(displayManager);
     webView = new InputAwareWebView(context, containerView);
+    displayListenerProxy.onPostWebViewInitialization(displayManager);
 
     platformThreadHandler = new Handler(context.getMainLooper());
     // Allow local storage.
     webView.getSettings().setDomStorageEnabled(true);
+    webView.getSettings().setJavaScriptCanOpenWindowsAutomatically(true);
+
+    // Multi windows is set with FlutterWebChromeClient by default to handle internal bug: b/159892679.
+    webView.getSettings().setSupportMultipleWindows(true);
+    webView.setWebChromeClient(new FlutterWebChromeClient());
 
     methodChannel = new MethodChannel(messenger, "plugins.flutter.io/webview_" + id);
     methodChannel.setMethodCallHandler(this);
 
     flutterWebViewClient = new FlutterWebViewClient(methodChannel);
-    applySettings((Map<String, Object>) params.get("settings"));
+    Map<String, Object> settings = (Map<String, Object>) params.get("settings");
+    if (settings != null) applySettings(settings);
 
     if (params.containsKey(JS_CHANNEL_NAMES_FIELD)) {
-      registerJavaScriptChannelNames((List<String>) params.get(JS_CHANNEL_NAMES_FIELD));
+      List<String> names = (List<String>) params.get(JS_CHANNEL_NAMES_FIELD);
+      if (names != null) registerJavaScriptChannelNames(names);
     }
 
+    Integer autoMediaPlaybackPolicy = (Integer) params.get("autoMediaPlaybackPolicy");
+    if (autoMediaPlaybackPolicy != null) updateAutoMediaPlaybackPolicy(autoMediaPlaybackPolicy);
+    if (params.containsKey("userAgent")) {
+      String userAgent = (String) params.get("userAgent");
+      updateUserAgent(userAgent);
+    }
     if (params.containsKey("initialUrl")) {
       String url = (String) params.get("initialUrl");
       webView.loadUrl(url);
@@ -80,6 +151,26 @@ public class FlutterWebView implements PlatformView, MethodCallHandler {
   // TODO(mklim): Add the @Override annotation once flutter/engine#9727 rolls to stable.
   public void onInputConnectionLocked() {
     webView.lockInputConnection();
+  }
+
+  // @Override
+  // This is overriding a method that hasn't rolled into stable Flutter yet. Including the
+  // annotation would cause compile time failures in versions of Flutter too old to include the new
+  // method. However leaving it raw like this means that the method will be ignored in old versions
+  // of Flutter but used as an override anyway wherever it's actually defined.
+  // TODO(mklim): Add the @Override annotation once stable passes v1.10.9.
+  public void onFlutterViewAttached(View flutterView) {
+    webView.setContainerView(flutterView);
+  }
+
+  // @Override
+  // This is overriding a method that hasn't rolled into stable Flutter yet. Including the
+  // annotation would cause compile time failures in versions of Flutter too old to include the new
+  // method. However leaving it raw like this means that the method will be ignored in old versions
+  // of Flutter but used as an override anyway wherever it's actually defined.
+  // TODO(mklim): Add the @Override annotation once stable passes v1.10.9.
+  public void onFlutterViewDetached() {
+    webView.setContainerView(null);
   }
 
   @Override
@@ -120,6 +211,21 @@ public class FlutterWebView implements PlatformView, MethodCallHandler {
         break;
       case "clearCache":
         clearCache(result);
+        break;
+      case "getTitle":
+        getTitle(result);
+        break;
+      case "scrollTo":
+        scrollTo(methodCall, result);
+        break;
+      case "scrollBy":
+        scrollBy(methodCall, result);
+        break;
+      case "getScrollX":
+        getScrollX(result);
+        break;
+      case "getScrollY":
+        getScrollY(result);
         break;
       default:
         result.notImplemented();
@@ -213,11 +319,43 @@ public class FlutterWebView implements PlatformView, MethodCallHandler {
     result.success(null);
   }
 
+  private void getTitle(Result result) {
+    result.success(webView.getTitle());
+  }
+
+  private void scrollTo(MethodCall methodCall, Result result) {
+    Map<String, Object> request = methodCall.arguments();
+    int x = (int) request.get("x");
+    int y = (int) request.get("y");
+
+    webView.scrollTo(x, y);
+
+    result.success(null);
+  }
+
+  private void scrollBy(MethodCall methodCall, Result result) {
+    Map<String, Object> request = methodCall.arguments();
+    int x = (int) request.get("x");
+    int y = (int) request.get("y");
+
+    webView.scrollBy(x, y);
+    result.success(null);
+  }
+
+  private void getScrollX(Result result) {
+    result.success(webView.getScrollX());
+  }
+
+  private void getScrollY(Result result) {
+    result.success(webView.getScrollY());
+  }
+
   private void applySettings(Map<String, Object> settings) {
     for (String key : settings.keySet()) {
       switch (key) {
         case "jsMode":
-          updateJsMode((Integer) settings.get(key));
+          Integer mode = (Integer) settings.get(key);
+          if (mode != null) updateJsMode(mode);
           break;
         case "hasNavigationDelegate":
           final boolean hasNavigationDelegate = (boolean) settings.get(key);
@@ -230,7 +368,20 @@ public class FlutterWebView implements PlatformView, MethodCallHandler {
         case "debuggingEnabled":
           final boolean debuggingEnabled = (boolean) settings.get(key);
 
-          webView.setWebContentsDebuggingEnabled(debuggingEnabled);
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            webView.setWebContentsDebuggingEnabled(debuggingEnabled);
+          }
+          break;
+        case "hasProgressTracking":
+          flutterWebViewClient.hasProgressTracking = (boolean) settings.get(key);
+          break;
+        case "gestureNavigationEnabled":
+          break;
+        case "userAgent":
+          updateUserAgent((String) settings.get(key));
+          break;
+        case "allowsInlineMediaPlayback":
+          // no-op inline media playback is always allowed on Android.
           break;
         default:
           throw new IllegalArgumentException("Unknown WebView setting: " + key);
@@ -251,6 +402,15 @@ public class FlutterWebView implements PlatformView, MethodCallHandler {
     }
   }
 
+  private void updateAutoMediaPlaybackPolicy(int mode) {
+    // This is the index of the AutoMediaPlaybackPolicy enum, index 1 is always_allow, for all
+    // other values we require a user gesture.
+    boolean requireUserGesture = mode != 1;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+      webView.getSettings().setMediaPlaybackRequiresUserGesture(requireUserGesture);
+    }
+  }
+
   private void registerJavaScriptChannelNames(List<String> channelNames) {
     for (String channelName : channelNames) {
       webView.addJavascriptInterface(
@@ -258,9 +418,14 @@ public class FlutterWebView implements PlatformView, MethodCallHandler {
     }
   }
 
+  private void updateUserAgent(String userAgent) {
+    webView.getSettings().setUserAgentString(userAgent);
+  }
+
   @Override
   public void dispose() {
     methodChannel.setMethodCallHandler(null);
     webView.dispose();
+    webView.destroy();
   }
 }
